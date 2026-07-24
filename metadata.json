@@ -1,0 +1,8 @@
+{
+  "name": "K-Fleet Link-営業業務改善",
+  "description": "建機・車両のプロセスを一元管理するダッシュボード",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
