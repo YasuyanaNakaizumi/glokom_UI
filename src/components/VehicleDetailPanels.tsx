@@ -26,6 +26,7 @@ export const VehicleDetailPanels: React.FC<{ vehicle: Vehicle }> = ({ vehicle })
       '承認待ち': 'views.vehicles.taskProgressPending',
       '進行中': 'views.vehicles.taskProgressInProgress',
       '完了': 'views.vehicles.taskProgressCompleted',
+      'スキップ': 'views.vehicles.taskProgressSkipped',
     };
     return progress ? t(progressMap[progress] || progress) : '';
   };

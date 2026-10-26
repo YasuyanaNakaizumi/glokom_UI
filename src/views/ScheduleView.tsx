@@ -77,7 +77,7 @@ export const ScheduleView = () => {
 
   // Tasks categorized
   const unassignedTasks = useMemo(() => tasks.filter(t => {
-    if ((t.staffIds && t.staffIds.length > 0) || t.progress === '完了') return false;
+    if ((t.staffIds && t.staffIds.length > 0) || t.progress === '完了' || t.progress === 'スキップ') return false;
     const group = TASK_GROUPINGS.find(g => g.categories.includes(t.category));
     if (!group) return true;
     return selectedTaskGroups.has(group.id);
@@ -88,6 +88,7 @@ export const ScheduleView = () => {
   const renderTasksOnTimeline = (resourceId: string, resourceType: 'mechanic' | 'parking' | 'special_vehicle') => {
     // Filter tasks that belong to this resource and intersect with currentDate
     const resourceTasks = tasks.filter(t => {
+      if (t.progress === 'スキップ') return false;
       // Very basic date match (same YYYY-MM-DD)
       const taskDate = t.startDate ? new Date(t.startDate) : t.deadline ? new Date(t.deadline) : new Date();
       if (format(taskDate, 'yyyy-MM-dd') !== format(currentDate, 'yyyy-MM-dd')) return false;
@@ -198,6 +199,7 @@ export const ScheduleView = () => {
 
   const renderTasksOnVerticalTimeline = (date: Date) => {
     const dateTasks = tasks.filter(t => {
+      if (t.progress === 'スキップ') return false;
       const taskDate = t.startDate ? new Date(t.startDate) : t.deadline ? new Date(t.deadline) : new Date();
       if (format(taskDate, 'yyyy-MM-dd') !== format(date, 'yyyy-MM-dd')) return false;
       

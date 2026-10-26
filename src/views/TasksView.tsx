@@ -93,6 +93,7 @@ export const TasksView = () => {
       case '進行中': return <span className="px-2 py-0.5 rounded text-xs font-bold bg-blue-100 text-blue-700 border border-blue-200">{tEnum('taskProgress', s)}</span>;
       case '承認待ち': return <span className="px-2 py-0.5 rounded text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200">{tEnum('taskProgress', s)}</span>;
       case '完了': return <span className="px-2 py-0.5 rounded text-xs font-bold bg-green-100 text-green-700 border border-green-200">{tEnum('taskProgress', s)}</span>;
+      case 'スキップ': return <span className="px-2 py-0.5 rounded text-xs font-bold bg-slate-100 text-slate-600 border border-slate-200">{tEnum('taskProgress', s)}</span>;
       default: return null;
     }
   };
@@ -232,6 +233,7 @@ export const TasksView = () => {
               <option value="進行中">{tEnum('taskProgress', '進行中')}</option>
               <option value="承認待ち">{tEnum('taskProgress', '承認待ち')}</option>
               <option value="完了">{tEnum('taskProgress', '完了')}</option>
+              <option value="スキップ">{tEnum('taskProgress', 'スキップ')}</option>
             </select>
           </div>
         </div>

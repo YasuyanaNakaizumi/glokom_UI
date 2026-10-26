@@ -1,20 +1,25 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
-import { Search, Info, Settings, MoreHorizontal, UserPlus, CheckCircle, Calendar, FileText, AlertTriangle, ShieldCheck, X, ChevronDown, ChevronUp } from 'lucide-react';
+import { Search, Info, Settings, MoreHorizontal, UserPlus, CheckCircle, Calendar, FileText, AlertTriangle, ShieldCheck, X, ChevronDown, ChevronUp, Pencil } from 'lucide-react';
 import { Vehicle, ServiceTask } from '../types';
 import { cn } from '../lib/utils';
-import { addDays, addMonths, differenceInDays, format, differenceInMonths } from 'date-fns';
+import { addDays, addMonths, differenceInDays, format, differenceInMonths, isSameMonth } from 'date-fns';
+import { getNextStockInspectionDate, getStockInspectionPlan, StockInspectionPlan } from '../lib/stockInspection';
+import { isTaskResolved } from '../lib/workflow';
 
 type FleetTab = 'required' | 'fc' | 'regular' | 'stock_calendar' | 'alerts';
+type WorkflowStepKey = 'receiving' | 'stockInspection' | 'preDeliveryInspection' | 'deliveryInspection' | 'patrol1' | 'patrol3' | 'patrol11';
 
 import { StockCalendarView } from './StockCalendarView';
 import { AlertListView } from './AlertListView';
 import { TaskReportApprovalModal } from '../components/TaskReportApprovalModal';
+import { EventCaseActions } from '../components/EventCaseActions';
 
 export const FleetView = () => {
-  const { vehicles, tasks, staff, updateTask, addTask, contracts, t, tEnum } = useApp();
+  const { vehicles, tasks, staff, updateVehicle, updateTask, addTask, contracts, t, tEnum } = useApp();
   const [tab, setTab] = useState<FleetTab>('required');
   const [searchTerm, setSearchTerm] = useState('');
+  const [focusedStockVehicleId, setFocusedStockVehicleId] = useState<string | null>(null);
   const [fcView, setFcView] = useState<'list' | 'vehicle'>('vehicle');
   const [fcVehicleFilter, setFcVehicleFilter] = useState(false);
   const [expandedFcVehicleId, setExpandedFcVehicleId] = useState<string | null>(null);
@@ -22,51 +27,137 @@ export const FleetView = () => {
   const [assignModal, setAssignModal] = useState<{
     vehicle: Vehicle;
     title: string;
+    taskTitle?: string;
     category: string;
     task?: ServiceTask;
     targetDate?: Date;
     targetSmr?: number;
+    blockedBy?: WorkflowStepKey;
+    caseAction?: 'create' | 'detail';
   } | null>(null);
 
   // Assignment Modal Form State
   const [assignStaffId, setAssignStaffId] = useState<string>('');
   const [assignDate, setAssignDate] = useState<string>('');
   const [approvalModalTask, setApprovalModalTask] = useState<ServiceTask | null>(null);
+  const [deliveryDateEditor, setDeliveryDateEditor] = useState<Vehicle | null>(null);
+  const [deliveryDateDraft, setDeliveryDateDraft] = useState('');
 
   const handleAssignSave = () => {
     if (!assignModal) return;
+    const scheduledDate = assignDate ? new Date(assignDate).toISOString() : undefined;
     
     if (assignModal.task) {
       // Update existing task
       updateTask(assignModal.task.id, {
         staffIds: assignStaffId ? [assignStaffId] : undefined,
-        startDate: assignDate ? new Date(assignDate).toISOString() : undefined,
-        progress: assignStaffId ? (assignModal.task.progress === '承認待ち' ? '承認待ち' : '進行中') : '未着手'
+        startDate: scheduledDate,
+        deadline: scheduledDate || assignModal.task.deadline,
+        progress: assignModal.task.progress === '完了'
+          ? '完了'
+          : assignStaffId
+            ? (assignModal.task.progress === '承認待ち' ? '承認待ち' : '進行中')
+            : '未着手'
       });
     } else {
       // Create new task
       addTask({
         vehicleId: assignModal.vehicle.id,
         targetModelName: assignModal.vehicle.modelName,
-        title: assignModal.title,
+        title: assignModal.taskTitle || assignModal.title,
         category: assignModal.category as any,
         urgency: '1ヶ月以内',
         progress: assignStaffId ? '進行中' : '未着手',
-        deadline: assignModal.targetDate ? assignModal.targetDate.toISOString() : addDays(new Date(), 14).toISOString(),
+        deadline: scheduledDate || (assignModal.targetDate ? assignModal.targetDate.toISOString() : addDays(new Date(), 14).toISOString()),
         staffIds: assignStaffId ? [assignStaffId] : undefined,
-        startDate: assignDate ? new Date(assignDate).toISOString() : undefined,
+        startDate: scheduledDate,
       });
     }
     setAssignModal(null);
   };
 
+  const openDeliveryDateEditor = (vehicle: Vehicle) => {
+    setDeliveryDateEditor(vehicle);
+    setDeliveryDateDraft(vehicle.deliveryDate ? format(new Date(vehicle.deliveryDate), 'yyyy-MM-dd') : '');
+  };
+
+  const handleDeliveryDateSave = () => {
+    if (!deliveryDateEditor) return;
+
+    const nextDeliveryDate = deliveryDateDraft
+      ? new Date(`${deliveryDateDraft}T00:00:00`).toISOString()
+      : undefined;
+
+    updateVehicle(deliveryDateEditor.id, { deliveryDate: nextDeliveryDate });
+
+    if (nextDeliveryDate) {
+      const deliveryBaseDate = new Date(nextDeliveryDate);
+      tasks
+        .filter(task => task.vehicleId === deliveryDateEditor.id)
+        .forEach(task => {
+          if (task.category === '納入作業') {
+            if (task.title.includes('納入前')) {
+              if (task.progress !== '完了') {
+                updateTask(task.id, { deadline: addDays(deliveryBaseDate, -1).toISOString() });
+              }
+            } else {
+              updateTask(task.id, { deadline: nextDeliveryDate });
+            }
+          }
+
+          if (task.category === '新車巡回' && task.progress !== '完了') {
+            const monthOffset = task.title.includes('11ヶ月') || task.title.includes('11か月') || task.title.includes('３回目')
+              ? 11
+              : task.title.includes('3ヶ月') || task.title.includes('3か月') || task.title.includes('２回目')
+                ? 3
+                : task.title.includes('1ヶ月') || task.title.includes('1か月') || task.title.includes('１回目')
+                  ? 1
+                  : null;
+
+            if (monthOffset) {
+              updateTask(task.id, { deadline: addMonths(deliveryBaseDate, monthOffset).toISOString() });
+            }
+          }
+        });
+    }
+
+    setDeliveryDateEditor(null);
+  };
+
   const handleReportSubmit = () => {
-    if (!assignModal || !assignModal.task) return;
+    if (!assignModal || !assignModal.task || assignModal.blockedBy) return;
     updateTask(assignModal.task.id, {
       staffIds: assignStaffId ? [assignStaffId] : undefined,
       startDate: assignDate ? new Date(assignDate).toISOString() : undefined,
       progress: '承認待ち'
     });
+    setAssignModal(null);
+  };
+
+  const handleSkipEvent = () => {
+    if (!assignModal || assignModal.blockedBy) return;
+    const scheduledDate = assignDate
+      ? new Date(assignDate).toISOString()
+      : assignModal.targetDate?.toISOString() || new Date().toISOString();
+
+    if (assignModal.task) {
+      updateTask(assignModal.task.id, {
+        progress: 'スキップ',
+        deadline: scheduledDate,
+        isApproved: false,
+      });
+    } else {
+      addTask({
+        vehicleId: assignModal.vehicle.id,
+        targetModelName: assignModal.vehicle.modelName,
+        title: assignModal.taskTitle || assignModal.title,
+        category: assignModal.category as any,
+        urgency: '1ヶ月以内',
+        progress: 'スキップ',
+        deadline: scheduledDate,
+      });
+    }
+
     setAssignModal(null);
   };
 
@@ -118,6 +209,8 @@ export const FleetView = () => {
     return tEnum('serviceCategory', category);
   };
 
+  const getWorkflowStepLabel = (step: WorkflowStepKey) => t(`fleet.requiredHeaders.${step}`);
+
   const getEventStatus = (
     v: Vehicle,
     vTasks: ServiceTask[],
@@ -126,10 +219,16 @@ export const FleetView = () => {
     targetDateStr?: string
   ) => {
     // Basic fuzzy match for title and exact for category
-    const task = vTasks.find(t => t.category === expectedCategory && (expectedTitle === '' || t.title.includes(expectedTitle)));
+    let task = vTasks.find(t => t.category === expectedCategory && (expectedTitle === '' || t.title.includes(expectedTitle)));
+    // Existing mock data used the generic title "納入作業". Treat it as the
+    // delivery inspection so existing progress is preserved after splitting the columns.
+    if (!task && expectedCategory === '納入作業' && expectedTitle === '納入点検') {
+      task = vTasks.find(t => t.category === expectedCategory && t.title.includes('納入作業'));
+    }
     let statusId = 'none';
     if (task) {
       if (task.progress === '完了') statusId = 'completed';
+      else if (task.progress === 'スキップ') statusId = 'skipped';
       else if (task.progress === '承認待ち') statusId = 'pending_approval';
       else if (task.staffId || (task.staffIds && task.staffIds.length > 0)) statusId = 'assigned';
       else statusId = 'unassigned';
@@ -139,7 +238,7 @@ export const FleetView = () => {
 
     let isApproaching = false;
     let targetDate = targetDateStr ? new Date(targetDateStr) : undefined;
-    if (targetDate && statusId !== 'completed') {
+    if (targetDate && statusId !== 'completed' && statusId !== 'skipped') {
       const daysDiff = differenceInDays(targetDate, new Date());
       if (daysDiff <= 30) isApproaching = true; // approaching if within 30 days or overdue
     }
@@ -150,14 +249,51 @@ export const FleetView = () => {
   const requiredData = useMemo(() => {
     return vehicles.map(v => {
       const vTasks = tasks.filter(t => t.vehicleId === v.id);
+      const stockInspectionPlan = getStockInspectionPlan(v, vTasks);
+      const isStockVehicle = stockInspectionPlan.isEligible;
+      const deliveryDate = v.deliveryDate ? new Date(v.deliveryDate) : undefined;
+      const receive = getEventStatus(v, vTasks, '受入', '受け入れ点検', v.arrivalDate);
+      const preDeliveryInspection = getEventStatus(v, vTasks, '納入前', '納入作業', deliveryDate ? addDays(deliveryDate, -1).toISOString() : undefined);
+      const deliveryInspection = getEventStatus(v, vTasks, '納入点検', '納入作業', v.deliveryDate);
+      const patrol1m = getEventStatus(v, vTasks, '1ヶ月', '新車巡回', deliveryDate ? addMonths(deliveryDate, 1).toISOString() : undefined);
+      const patrol3m = getEventStatus(v, vTasks, '3ヶ月', '新車巡回', deliveryDate ? addMonths(deliveryDate, 3).toISOString() : undefined);
+      const patrol11m = getEventStatus(v, vTasks, '11ヶ月', '新車巡回', deliveryDate ? addMonths(deliveryDate, 11).toISOString() : undefined);
+
+      const receiveResolved = isTaskResolved(receive.task);
+      const stockTasks = vTasks.filter(task => task.category === '在庫点検');
+      const stockInspectionResolved = !isStockVehicle || (
+        !stockInspectionPlan.isProvisional &&
+        stockInspectionPlan.dueDates.every(dueDate =>
+          stockTasks.some(task => isTaskResolved(task) && isSameMonth(new Date(task.deadline), dueDate))
+        )
+      );
+      const stockBlockedBy: WorkflowStepKey | undefined = receiveResolved ? undefined : 'receiving';
+      const stockStepResolved = receiveResolved && stockInspectionResolved;
+      const preDeliveryBlockedBy: WorkflowStepKey | undefined = !receiveResolved
+        ? 'receiving'
+        : !stockStepResolved
+          ? 'stockInspection'
+          : undefined;
+      const preDeliveryResolved = !preDeliveryBlockedBy && isTaskResolved(preDeliveryInspection.task);
+      const deliveryBlockedBy: WorkflowStepKey | undefined = preDeliveryResolved ? undefined : 'preDeliveryInspection';
+      const deliveryResolved = !deliveryBlockedBy && isTaskResolved(deliveryInspection.task);
+      const patrol1BlockedBy: WorkflowStepKey | undefined = deliveryResolved ? undefined : 'deliveryInspection';
+      const patrol1Resolved = !patrol1BlockedBy && isTaskResolved(patrol1m.task);
+      const patrol3BlockedBy: WorkflowStepKey | undefined = patrol1Resolved ? undefined : 'patrol1';
+      const patrol3Resolved = !patrol3BlockedBy && isTaskResolved(patrol3m.task);
+      const patrol11BlockedBy: WorkflowStepKey | undefined = patrol3Resolved ? undefined : 'patrol3';
+
       return {
         v,
-        receive: getEventStatus(v, vTasks, '受入', '受け入れ点検', v.arrivalDate),
-        delivery: getEventStatus(v, vTasks, '納入', '納入作業', v.deliveryDate),
-        patrol1m: getEventStatus(v, vTasks, '1ヶ月', '新車巡回', v.deliveryDate ? addMonths(new Date(v.deliveryDate), 1).toISOString() : undefined),
-        patrol3m: getEventStatus(v, vTasks, '3ヶ月', '新車巡回', v.deliveryDate ? addMonths(new Date(v.deliveryDate), 3).toISOString() : undefined),
-        patrol5m: getEventStatus(v, vTasks, '5ヶ月', '新車巡回', v.deliveryDate ? addMonths(new Date(v.deliveryDate), 5).toISOString() : undefined),
-        patrol11m: getEventStatus(v, vTasks, '11ヶ月', '新車巡回', v.deliveryDate ? addMonths(new Date(v.deliveryDate), 11).toISOString() : undefined),
+        isStockVehicle,
+        stockInspectionPlan,
+        stockBlockedBy,
+        receive,
+        preDeliveryInspection: { ...preDeliveryInspection, blockedBy: preDeliveryBlockedBy },
+        deliveryInspection: { ...deliveryInspection, blockedBy: deliveryBlockedBy },
+        patrol1m: { ...patrol1m, blockedBy: patrol1BlockedBy },
+        patrol3m: { ...patrol3m, blockedBy: patrol3BlockedBy },
+        patrol11m: { ...patrol11m, blockedBy: patrol11BlockedBy },
       };
     }).filter(d => {
       if (!searchTerm) return true;
@@ -330,45 +466,72 @@ export const FleetView = () => {
     });
   }, [vehicles, tasks, searchTerm, contracts]);
 
-  const EventCell = ({ event, title, category, v }: { event: any, title: string, category: string, v: Vehicle }) => {
+  const EventCell = ({ event, title, taskTitle, category, v }: { event: any, title: string, taskTitle: string, category: string, v: Vehicle }) => {
     const isCompleted = event.statusId === 'completed';
+    const isSkipped = event.statusId === 'skipped';
     const isPendingApproval = event.statusId === 'pending_approval';
     const isAssigned = event.statusId === 'assigned';
     const isApproaching = event.isApproaching;
+    const blockedBy = event.blockedBy as WorkflowStepKey | undefined;
 
     const taskDateStr = event.task?.deadline ? event.task.deadline : event.task?.startDate;
     const dateValue = taskDateStr ? new Date(taskDateStr) : event.targetDate;
     const dateStr = dateValue ? format(dateValue, 'yyyy-MM-dd') : t('common.notSet');
     
     // Also derive staff name
-    const staffName = event.task?.staffId 
-       ? staff.find(s => s.id === event.task.staffId)?.name || t('common.notSet') 
+    const assignedStaffId = event.task?.staffIds?.[0] || event.task?.staffId;
+    const staffName = assignedStaffId
+       ? staff.find(s => s.id === assignedStaffId)?.name || t('common.notSet')
        : t('common.notSet');
 
-    const showDeliveryInfo = category === '新車巡回';
-    const deliveryDateStr = v.deliveryDate ? format(new Date(v.deliveryDate), 'MM/dd') : t('common.notSet');
-
     const onClick = () => {
-      if (isPendingApproval && event.task) {
+      if (isPendingApproval && event.task && !blockedBy) {
         setApprovalModalTask(event.task);
-      } else if (!isCompleted && !isPendingApproval) {
-        setAssignModal({ vehicle: v, title, category, task: event.task, targetDate: event.targetDate });
-        setAssignStaffId(event.task?.staffId || '');
-        setAssignDate(event.task?.startDate?.split('T')[0] || '');
+      } else if ((!isSkipped && !isPendingApproval) || blockedBy) {
+        setAssignModal({
+          vehicle: v, title, taskTitle, category, task: event.task,
+          targetDate: event.targetDate, blockedBy,
+          caseAction: !blockedBy && (isCompleted || isAssigned) ? 'detail' : 'create',
+        });
+        setAssignStaffId(event.task?.staffIds?.[0] || event.task?.staffId || '');
+        setAssignDate((event.task?.deadline || event.task?.startDate)?.split('T')[0] || (event.targetDate ? format(event.targetDate, 'yyyy-MM-dd') : ''));
       }
     };
+
+    if (blockedBy) {
+      return (
+        <div
+          onClick={onClick}
+          className="flex min-h-[95px] h-full cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white p-2 text-slate-500 transition hover:border-slate-400"
+        >
+          <span className="text-[11px] font-bold text-slate-500">{t('fleet.event.notExecuted')}</span>
+          <span className="mt-1.5 font-mono text-[11px] font-bold text-slate-600">{dateStr}</span>
+          <span className="mt-1 w-full truncate px-1 text-center text-[10px] font-bold text-slate-500">
+            {t('fleet.event.assigneePrefix')} {staffName}
+          </span>
+        </div>
+      );
+    }
 
     if (isCompleted) {
       return (
         <div 
           onClick={onClick}
-          className="flex flex-col items-center justify-center p-2 rounded-xl border border-emerald-200 bg-emerald-50/80 cursor-pointer hover:bg-emerald-100 transition h-full text-emerald-700 min-h-[95px]"
+          className="relative flex flex-col items-center justify-center p-2 rounded-xl border border-emerald-200 bg-emerald-50/80 cursor-pointer hover:bg-emerald-100 transition h-full text-emerald-700 min-h-[95px]"
         >
           <CheckCircle className="w-5 h-5 mb-1 text-emerald-500 shrink-0" />
           <span className="text-[12px] font-bold">{getTaskProgressLabel('完了')}</span>
           <span className="text-[11px] text-emerald-600 font-bold mt-1 font-mono">{dateStr}</span>
           <span className="text-[10px] text-emerald-700/80 mt-1 truncate w-full px-1 text-center">{staffName}</span>
-          {showDeliveryInfo && <span className="text-[9px] text-emerald-600/60 mt-0.5">{t('fleet.event.deliveryPrefix')}{deliveryDateStr}</span>}
+        </div>
+      );
+    }
+
+    if (isSkipped) {
+      return (
+        <div className="flex min-h-[95px] h-full flex-col items-center justify-center rounded-xl border border-slate-300 bg-slate-100 p-2 text-slate-600">
+          <span className="rounded bg-slate-200 px-2 py-0.5 text-[12px] font-black">{getTaskProgressLabel('スキップ')}</span>
+          <span className="mt-1.5 font-mono text-[11px] font-bold text-slate-500">{dateStr}</span>
         </div>
       );
     }
@@ -382,7 +545,6 @@ export const FleetView = () => {
           <span className="text-[12px] font-bold bg-amber-200 text-amber-900 px-2 py-0.5 rounded animate-pulse shadow-sm">{getTaskProgressLabel('承認待ち')}</span>
           <span className="text-[11px] font-bold mt-1.5 font-mono text-amber-900">{dateStr}</span>
           <span className="text-[10px] text-amber-700 mt-1 truncate w-full px-1 text-center font-bold">{staffName}</span>
-          {showDeliveryInfo && <span className="text-[9px] text-amber-600/60 mt-0.5">{t('fleet.event.deliveryPrefix')}{deliveryDateStr}</span>}
         </div>
       );
     }
@@ -399,7 +561,6 @@ export const FleetView = () => {
            <span className="text-[12px] font-bold bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded shadow-sm">{t('fleet.event.assigned')}</span>
            <span className="text-[11px] font-bold mt-1.5 font-mono text-indigo-800">{dateStr}</span>
            <span className="text-[10px] text-indigo-600 mt-1 truncate w-full px-1 text-center font-bold">{staffName}</span>
-           {showDeliveryInfo && <span className="text-[9px] text-indigo-600/60 mt-0.5">{t('fleet.event.deliveryPrefix')}{deliveryDateStr}</span>}
          </div>
        );
     }
@@ -422,8 +583,66 @@ export const FleetView = () => {
         )}
         <span className={cn("text-[11px] font-bold mt-1.5 font-mono", isApproaching ? "text-amber-800" : "text-slate-600")}>{dateStr}</span>
         <span className={cn("text-[10px] mt-1 truncate w-full px-1 text-center font-bold", isApproaching ? "text-amber-700" : "text-slate-500")}>{t('fleet.event.assigneePrefix')} {t('common.notSet')}</span>
-        {showDeliveryInfo && <span className={cn("text-[9px] mt-0.5", isApproaching ? "text-amber-600/70" : "text-slate-400")}>{t('fleet.event.deliveryPrefix')}{deliveryDateStr}</span>}
       </div>
+    );
+  };
+
+  const NotApplicableCell = () => (
+    <div className="flex flex-col items-center justify-center p-2 rounded-xl border border-slate-200 bg-slate-50/70 h-full min-h-[95px] text-slate-400">
+      <span className="text-[11px] font-bold">{t('fleet.event.notApplicableAutoSkip')}</span>
+      <span className="text-[10px] mt-1 text-center whitespace-normal leading-relaxed">{t('fleet.event.longTermStockOnly')}</span>
+    </div>
+  );
+
+  const StockInspectionSummaryCell = ({ vehicle, plan, blockedBy }: { vehicle: Vehicle, plan: StockInspectionPlan, blockedBy?: WorkflowStepKey }) => {
+    const stockTasks = tasks.filter(task => task.vehicleId === vehicle.id && task.category === '在庫点検');
+    const resolvedCount = plan.dueDates.filter(dueDate =>
+      stockTasks.some(task => isTaskResolved(task) && isSameMonth(new Date(task.deadline), dueDate))
+    ).length;
+    const nextDueDate = getNextStockInspectionDate(plan, stockTasks);
+
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          setFocusedStockVehicleId(vehicle.id);
+          setTab('stock_calendar');
+        }}
+        className={cn(
+          "flex min-h-[95px] h-full w-full flex-col items-center justify-center rounded-xl border p-2 transition",
+          blockedBy
+            ? "border-dashed border-slate-300 bg-white text-slate-500 hover:border-slate-400"
+            : "border-emerald-200 bg-emerald-50/80 text-emerald-800 hover:border-emerald-300 hover:bg-emerald-100"
+        )}
+      >
+        {blockedBy && (
+          <>
+            <span className="text-[11px] font-bold text-slate-500">{t('fleet.event.notExecuted')}</span>
+            <span className="mt-1.5 font-mono text-[11px] font-bold text-slate-600">
+              {nextDueDate ? format(nextDueDate, 'yyyy-MM-dd') : t('common.notSet')}
+            </span>
+            <span className="mt-1 text-[10px] font-bold text-slate-500">
+              {t('fleet.event.assigneePrefix')} {t('common.notSet')}
+            </span>
+          </>
+        )}
+        {!blockedBy && (
+          <>
+        <span className="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-black">{t('fleet.event.monthlyManagement')}</span>
+        <span className="mt-1.5 text-[12px] font-black">
+          {plan.isProvisional
+            ? t('fleet.event.provisionalMonthlySchedule')
+            : t('fleet.event.stockInspectionProgress', { completed: resolvedCount, total: plan.dueDates.length })}
+        </span>
+        <span className="mt-1 text-[10px] font-bold text-emerald-700">
+          {nextDueDate
+            ? t('fleet.event.nextInspection', { date: format(nextDueDate, 'yyyy-MM-dd') })
+            : t('fleet.event.allInspectionsCompleted')}
+        </span>
+        <span className="mt-1 text-[9px] text-emerald-600">{t('fleet.event.openStockCalendar')}</span>
+          </>
+        )}
+      </button>
     );
   };
 
@@ -485,36 +704,76 @@ export const FleetView = () => {
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 flex-1 overflow-hidden flex flex-col min-h-0">
         {tab === 'required' && (
           <div className="overflow-auto flex-1">
-            <table className="w-full text-sm text-center border-collapse whitespace-nowrap">
+            <table className="w-full min-w-[1580px] text-sm text-center border-collapse whitespace-nowrap">
               <thead className="bg-slate-50 text-slate-700 sticky top-0 shadow-[0_1px_0_rgba(200,200,200,1)] z-10">
                 <tr>
-                  <th className="px-4 py-4 text-left font-bold text-xs tracking-wider border-b border-slate-200 sticky left-0 bg-slate-50 z-20">{t('fleet.requiredHeaders.vehicle')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.receiving')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.delivery')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol1')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol3')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol5')}</th>
-                  <th className="px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol11')}</th>
+                  <th className="min-w-[285px] px-4 py-4 text-left font-bold text-xs tracking-wider border-b border-slate-200 sticky left-0 bg-slate-50 z-20">{t('fleet.requiredHeaders.vehicle')}</th>
+                  <th className="min-w-[165px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.receiving')}</th>
+                  <th className="min-w-[165px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.stockInspection')}</th>
+                  <th className="min-w-[165px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.preDeliveryInspection')}</th>
+                  <th className="min-w-[165px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.deliveryInspection')}</th>
+                  <th className="min-w-[180px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol1')}</th>
+                  <th className="min-w-[180px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol3')}</th>
+                  <th className="min-w-[180px] px-3 py-4 font-bold text-xs tracking-wider border-b border-slate-200">{t('fleet.requiredHeaders.patrol11')}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {requiredData.map((d) => (
                   <tr key={d.v.id} className="hover:bg-indigo-50/30 transition group">
                     <td className="px-4 py-3 text-left sticky left-0 bg-white group-hover:bg-indigo-50/10 z-10 border-r border-slate-100">
-                      <div className="font-bold text-slate-900">{d.v.modelName} <span className="text-slate-400 font-normal text-xs ml-1">{d.v.serialNumber}</span></div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="font-bold text-slate-900">
+                          {d.v.modelName} <span className="text-slate-400 font-normal text-xs ml-1">{d.v.serialNumber}</span>
+                        </div>
+                        {d.isStockVehicle && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFocusedStockVehicleId(d.v.id);
+                              setTab('stock_calendar');
+                            }}
+                            className="inline-flex items-center rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-100"
+                            title={t('fleet.stockCalendarShortcutTitle')}
+                          >
+                            <Calendar className="mr-1 h-3 w-3" />
+                            {t('fleet.stockCalendarShortcut')}
+                          </button>
+                        )}
+                      </div>
                       <div className="text-slate-500 mt-0.5 text-xs font-medium">{d.v.customerName || <span className="text-slate-300">{t('fleet.inStockLabel')}</span>}</div>
+                      <button
+                        type="button"
+                        onClick={() => openDeliveryDateEditor(d.v)}
+                        className={cn(
+                          "mt-2 flex w-full items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition",
+                          d.v.deliveryDate
+                            ? "border-indigo-100 bg-indigo-50/70 text-indigo-800 hover:bg-indigo-100"
+                            : "border-dashed border-amber-300 bg-amber-50/60 text-amber-800 hover:bg-amber-100"
+                        )}
+                      >
+                        <span>
+                          <span className="block text-[9px] font-bold uppercase tracking-wide opacity-70">
+                            {d.v.status === '納入済' ? t('fleet.deliveryDateLabel') : t('fleet.plannedDeliveryDateLabel')}
+                          </span>
+                          <span className="block font-mono text-[11px] font-black">
+                            {d.v.deliveryDate ? format(new Date(d.v.deliveryDate), 'yyyy-MM-dd') : t('fleet.deliveryDateNotSet')}
+                          </span>
+                        </span>
+                        <Pencil className="h-3.5 w-3.5 shrink-0" />
+                      </button>
                     </td>
-                    <td className="px-3 py-3"><EventCell event={d.receive} title={t('fleet.requiredHeaders.receiving')} category="受け入れ点検" v={d.v} /></td>
-                    <td className="px-3 py-3"><EventCell event={d.delivery} title={t('fleet.requiredHeaders.delivery')} category="納入作業" v={d.v} /></td>
-                    <td className="px-3 py-3 border-l border-slate-100/50 bg-slate-50/30"><EventCell event={d.patrol1m} title={t('fleet.requiredHeaders.patrol1')} category="新車巡回" v={d.v} /></td>
-                    <td className="px-3 py-3 bg-slate-50/30"><EventCell event={d.patrol3m} title={t('fleet.requiredHeaders.patrol3')} category="新車巡回" v={d.v} /></td>
-                    <td className="px-3 py-3 bg-slate-50/30"><EventCell event={d.patrol5m} title={t('fleet.requiredHeaders.patrol5')} category="新車巡回" v={d.v} /></td>
-                    <td className="px-3 py-3 bg-slate-50/30"><EventCell event={d.patrol11m} title={t('fleet.requiredHeaders.patrol11')} category="新車巡回" v={d.v} /></td>
+                    <td className="px-3 py-3"><EventCell event={d.receive} title={t('fleet.requiredHeaders.receiving')} taskTitle="受入点検" category="受け入れ点検" v={d.v} /></td>
+                    <td className="px-3 py-3">{d.isStockVehicle ? <StockInspectionSummaryCell vehicle={d.v} plan={d.stockInspectionPlan} blockedBy={d.stockBlockedBy} /> : <NotApplicableCell />}</td>
+                    <td className="px-3 py-3"><EventCell event={d.preDeliveryInspection} title={t('fleet.requiredHeaders.preDeliveryInspection')} taskTitle="納入前点検" category="納入作業" v={d.v} /></td>
+                    <td className="px-3 py-3"><EventCell event={d.deliveryInspection} title={t('fleet.requiredHeaders.deliveryInspection')} taskTitle="納入点検" category="納入作業" v={d.v} /></td>
+                    <td className="px-3 py-3 border-l border-slate-100/50 bg-slate-50/30"><EventCell event={d.patrol1m} title={t('fleet.requiredHeaders.patrol1')} taskTitle="1ヶ月 新車巡回" category="新車巡回" v={d.v} /></td>
+                    <td className="px-3 py-3 bg-slate-50/30"><EventCell event={d.patrol3m} title={t('fleet.requiredHeaders.patrol3')} taskTitle="3ヶ月 新車巡回" category="新車巡回" v={d.v} /></td>
+                    <td className="px-3 py-3 bg-slate-50/30"><EventCell event={d.patrol11m} title={t('fleet.requiredHeaders.patrol11')} taskTitle="11ヶ月 新車巡回" category="新車巡回" v={d.v} /></td>
                   </tr>
                 ))}
                 {requiredData.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="py-12 text-slate-400 font-bold text-center">{t('fleet.requiredEmpty')}</td>
+                    <td colSpan={8} className="py-12 text-slate-400 font-bold text-center">{t('fleet.requiredEmpty')}</td>
                   </tr>
                 )}
               </tbody>
@@ -852,7 +1111,7 @@ export const FleetView = () => {
 
         {tab === 'stock_calendar' && (
           <div className="flex-1 overflow-auto bg-slate-50/50 p-6">
-             <StockCalendarView isEmbedded={true} />
+             <StockCalendarView isEmbedded={true} focusVehicleId={focusedStockVehicleId || undefined} />
           </div>
         )}
         {tab === 'alerts' && (
@@ -865,28 +1124,28 @@ export const FleetView = () => {
       {/* Assign Modal */}
       {assignModal && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4" onClick={() => setAssignModal(null)}>
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="max-h-[90vh] bg-white rounded-2xl shadow-2xl w-full max-w-lg flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
              <div className="px-6 py-5 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
                <h3 className="font-black text-xl text-slate-800 flex items-center">
                  <FileText className="w-5 h-5 mr-2 text-indigo-600" />
-                 イベント詳細とアサイン
+                 {t('fleet.event.modalTitle')}
                </h3>
                <button onClick={() => setAssignModal(null)} className="text-slate-400 hover:text-slate-600 bg-slate-200/50 p-2 rounded-full hover:bg-slate-200 transition">
                  <X className="w-5 h-5" />
                </button>
              </div>
              
-             <div className="p-6 space-y-6">
+             <div className="overflow-y-auto p-6 space-y-6">
                 <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4">
                   <div className="text-xs font-bold text-indigo-400 mb-1">{assignModal.category}</div>
                   <div className="text-lg font-black text-indigo-900 mb-2">{assignModal.title}</div>
                   <div className="flex flex-wrap gap-2">
                     <span className="bg-white text-slate-700 border border-slate-200 px-2 py-1 rounded text-xs font-bold shadow-sm">
-                      車両: {assignModal.vehicle.modelName} ({assignModal.vehicle.serialNumber})
+                      {t('fleet.event.vehicleLabel')}: {assignModal.vehicle.modelName} ({assignModal.vehicle.serialNumber})
                     </span>
                     {assignModal.targetDate && (
                       <span className="bg-white text-slate-700 border border-slate-200 px-2 py-1 rounded text-xs font-bold shadow-sm">
-                        予定期限: {format(assignModal.targetDate, 'yyyy/MM/dd')}
+                        {t('fleet.event.targetDateLabel')}: {format(assignModal.targetDate, 'yyyy/MM/dd')}
                       </span>
                     )}
                     {assignModal.targetSmr && (
@@ -897,11 +1156,23 @@ export const FleetView = () => {
                   </div>
                 </div>
 
+                {assignModal.blockedBy && (
+                  <div className="flex items-start rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-700">
+                    <Info className="mr-3 mt-0.5 h-5 w-5 shrink-0 text-indigo-500" />
+                    <div>
+                      <p className="text-sm font-black">{t('fleet.event.workflowGuidanceTitle')}</p>
+                      <p className="mt-1 text-xs font-medium leading-relaxed">
+                        {t('fleet.event.completionBlockedDescription', { step: getWorkflowStepLabel(assignModal.blockedBy) })}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 <div className="space-y-4">
                   <div className="space-y-2">
                     <label className="text-sm font-bold text-slate-700 flex items-center">
                       <Calendar className="w-4 h-4 mr-1 text-slate-400" />
-                      実施予定日
+                      {t('fleet.event.scheduledDateLabel')}
                     </label>
                     <input 
                       type="date"
@@ -914,45 +1185,126 @@ export const FleetView = () => {
                   <div className="space-y-2">
                     <label className="text-sm font-bold text-slate-700 flex items-center">
                       <UserPlus className="w-4 h-4 mr-1 text-slate-400" />
-                      担当者アサイン
+                      {t('fleet.event.assigneeLabel')}
                     </label>
                     <select 
                       className="w-full border border-slate-300 rounded-lg px-4 py-2.5 font-medium text-slate-700 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
                       value={assignStaffId}
                       onChange={e => setAssignStaffId(e.target.value)}
                     >
-                      <option value="">未定 (アサインしない)</option>
+                      <option value="">{t('fleet.event.noAssigneeOption')}</option>
                       {staff.map(s => (
                         <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
                       ))}
                     </select>
                   </div>
                 </div>
+
+                {assignModal.caseAction && <EventCaseActions action={assignModal.caseAction} />}
              </div>
              
-             <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
+             <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 shrink-0">
+               <button
+                 type="button"
+                 onClick={handleSkipEvent}
+                 disabled={Boolean(assignModal.blockedBy) || assignModal.task?.progress === '完了'}
+                 className="whitespace-nowrap rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-bold text-slate-600 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+               >
+                 {t('fleet.event.skipStep')}
+               </button>
+               <div className="flex flex-wrap justify-end gap-3">
                <button 
                  onClick={() => setAssignModal(null)}
-                 className="px-5 py-2.5 text-slate-600 font-bold rounded-lg hover:bg-slate-200 transition"
+                 className="whitespace-nowrap px-5 py-2.5 text-slate-600 font-bold rounded-lg hover:bg-slate-200 transition"
                >
                  キャンセル
                </button>
                <button 
                  onClick={handleAssignSave}
-                 className="px-6 py-2.5 bg-slate-800 text-white font-bold rounded-lg hover:bg-slate-900 transition shadow-sm"
+                 className="whitespace-nowrap px-6 py-2.5 bg-slate-800 text-white font-bold rounded-lg hover:bg-slate-900 transition shadow-sm"
                >
-                 保存する
+                 {t('fleet.event.saveButton')}
                </button>
-               {assignModal.task && assignModal.task.progress !== '承認待ち' && (
+               {assignModal.task && assignModal.task.progress !== '承認待ち' && assignModal.task.progress !== '完了' && !assignModal.blockedBy && (
                  <button 
                    onClick={handleReportSubmit}
-                   className="px-6 py-2.5 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition shadow-md shadow-indigo-200 flex items-center"
+                   className="whitespace-nowrap px-6 py-2.5 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition shadow-md shadow-indigo-200 flex items-center"
                  >
                    <CheckCircle className="w-4 h-4 mr-2" />
-                   完了報告 (承認待ちへ)
+                   {t('fleet.event.reportSubmitButton')}
                  </button>
                )}
+               </div>
              </div>
+          </div>
+        </div>
+      )}
+
+      {deliveryDateEditor && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm"
+          onClick={() => setDeliveryDateEditor(null)}
+        >
+          <div
+            className="w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-6 py-5">
+              <div>
+                <h3 className="flex items-center text-lg font-black text-slate-800">
+                  <Calendar className="mr-2 h-5 w-5 text-indigo-600" />
+                  {deliveryDateEditor.status === '納入済' ? t('fleet.editDeliveryDateTitle') : t('fleet.editPlannedDeliveryDateTitle')}
+                </h3>
+                <p className="mt-1 text-xs font-medium text-slate-500">
+                  {deliveryDateEditor.modelName} / {deliveryDateEditor.serialNumber}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeliveryDateEditor(null)}
+                className="rounded-full bg-slate-200/60 p-2 text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4 p-6">
+              <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-4 text-sm text-indigo-900">
+                <p className="font-bold">{t('fleet.deliveryDateEditDescription')}</p>
+                <p className="mt-1 text-xs leading-relaxed text-indigo-700">
+                  {t('fleet.deliveryDateEditHint')}
+                </p>
+              </div>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-bold text-slate-700">
+                  {deliveryDateEditor.status === '納入済' ? t('fleet.deliveryDateLabel') : t('fleet.plannedDeliveryDateLabel')}
+                </span>
+                <input
+                  type="date"
+                  value={deliveryDateDraft}
+                  onChange={event => setDeliveryDateDraft(event.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-4 py-3 font-mono font-bold text-slate-800 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
+                />
+              </label>
+            </div>
+
+            <div className="flex justify-end gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => setDeliveryDateEditor(null)}
+                className="rounded-lg px-5 py-2.5 font-bold text-slate-600 transition hover:bg-slate-200"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={handleDeliveryDateSave}
+                className="rounded-lg bg-indigo-600 px-6 py-2.5 font-bold text-white shadow-sm transition hover:bg-indigo-700"
+              >
+                {t('fleet.saveDeliveryDate')}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -967,4 +1319,3 @@ export const FleetView = () => {
     </div>
   );
 };
-

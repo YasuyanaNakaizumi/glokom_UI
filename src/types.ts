@@ -1,7 +1,7 @@
 export type VehicleStatus = '受け入れ予定'|'出荷済'|'搬入済'|'点検中'|'点検完了'|'在庫'|'納入済';
 export type ServiceCategory = '新車巡回'|'故障修理'|'定期点検'|'車検'|'受け入れ点検'|'フィールドキャンペーン'|'在庫点検'|'納入作業'|'その他予定' | (string & {});
 export type Urgency = '緊急'|'1ヶ月以内'|'数ヶ月後';
-export type TaskProgress = '未着手'|'進行中'|'承認待ち'|'完了';
+export type TaskProgress = '未着手'|'進行中'|'承認待ち'|'完了'|'スキップ';
 export type StockStatus = '即納(引当済)'|'フリー在庫'|'納入済';
 
 export interface Customer {

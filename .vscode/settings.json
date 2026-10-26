@@ -1,0 +1,16 @@
+{
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "npm.packageManager": "npm",
+  "files.hotExit": "onExitAndWindowClose",
+  "window.restoreWindows": "all",
+  "workbench.startupEditor": "none",
+  "task.allowAutomaticTasks": "on",
+  "remote.autoForwardPorts": true,
+  "remote.portsAttributes": {
+    "3000": {
+      "label": "Global KomServ UI Mock",
+      "onAutoForward": "openBrowser"
+    }
+  }
+}

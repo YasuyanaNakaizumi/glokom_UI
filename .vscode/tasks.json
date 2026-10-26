@@ -1,0 +1,57 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Global KomServ: 前回の編集ファイルを開く",
+      "type": "shell",
+      "command": "code",
+      "args": [
+        "--reuse-window",
+        "${workspaceFolder}/src/views/FleetView.tsx",
+        "${workspaceFolder}/src/views/StockCalendarView.tsx",
+        "${workspaceFolder}/src/lib/i18n.ts"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "close": true
+      }
+    },
+    {
+      "label": "Global KomServ: 開発サーバー",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "global-komserv-vite",
+        "pattern": {
+          "regexp": "^(?!)$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^.*VITE.*$",
+          "endsPattern": "^.*Local:.*3000.*$"
+        }
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "group": "global-komserv",
+        "clear": true
+      }
+    },
+    {
+      "label": "Global KomServ: 前回の続きから開始",
+      "dependsOrder": "parallel",
+      "dependsOn": [
+        "Global KomServ: 前回の編集ファイルを開く",
+        "Global KomServ: 開発サーバー"
+      ],
+      "problemMatcher": [],
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    }
+  ]
+}

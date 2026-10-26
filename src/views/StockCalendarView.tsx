@@ -1,19 +1,37 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { ArrowLeft, Calendar, Search, CheckCircle2, AlertTriangle, Clock, Package, ChevronLeft, ChevronRight, X, User, RefreshCw, MessageSquare, Send, Trash2, AlertCircle, CheckCircle, Save, ShieldCheck, ShieldAlert, Truck, Box, Info } from 'lucide-react';
-import { addMonths, subMonths, format, startOfMonth, isSameMonth, isBefore, isAfter, differenceInMonths } from 'date-fns';
+import { Calendar, Search, CheckCircle2, AlertTriangle, Package, ChevronLeft, ChevronRight, X, Trash2, CheckCircle, Truck, Box, Info, FileText, UserPlus } from 'lucide-react';
+import { addMonths, subMonths, format, startOfMonth, isSameMonth, isBefore } from 'date-fns';
 import { ja, enUS } from 'date-fns/locale';
 import { cn } from '../lib/utils';
 import { ServiceTask, Vehicle } from '../types';
-import { TaskConfigSection } from '../components/AddDeliveryModal';
+import { EventCaseActions } from '../components/EventCaseActions';
+import { getStockInspectionDateForMonth, getStockInspectionPlan } from '../lib/stockInspection';
+import { isTaskResolved } from '../lib/workflow';
 
-export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean }) => {
+export const StockCalendarView = ({ isEmbedded = false, focusVehicleId }: { isEmbedded?: boolean, focusVehicleId?: string }) => {
   const { vehicles, tasks, setView, t, staff, lang, tEnum } = useApp();
   const [searchTerm, setSearchTerm] = useState('');
   const [currentDate, setCurrentDate] = useState(startOfMonth(new Date()));
-  const [selectedTaskContext, setSelectedTaskContext] = useState<{vehicleId: string, month: Date, taskId?: string} | null>(null);
+  const [selectedTaskContext, setSelectedTaskContext] = useState<{vehicleId: string, month: Date, taskId?: string, plannedDate?: Date} | null>(null);
   
   const [inventoryType, setInventoryType] = useState<'vehicle' | 'parts'>('vehicle');
+
+  useEffect(() => {
+    if (!focusVehicleId) return;
+    const focusedVehicle = vehicles.find(vehicle => vehicle.id === focusVehicleId);
+    setInventoryType('vehicle');
+    setSearchTerm(focusedVehicle?.serialNumber || '');
+    if (focusedVehicle) {
+      const plan = getStockInspectionPlan(focusedVehicle, tasks);
+      if (plan.dueDates[0]) {
+        const focusDate = plan.isProvisional && isBefore(plan.dueDates[0], new Date())
+          ? new Date()
+          : plan.dueDates[0];
+        setCurrentDate(startOfMonth(focusDate));
+      }
+    }
+  }, [focusVehicleId, vehicles]);
 
   const [assignModalData, setAssignModalData] = useState<{type: 'vehicle' | 'parts', id: string, name: string} | null>(null);
   const [parts, setParts] = useState([
@@ -23,21 +41,17 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
     { id: 'p4', name: 'バッテリー 48V', qty: 5, arrivalDate: '2024-01-20' },
   ]);
 
-  // Target vehicles: 在庫, 点検中, 搬入済, 出荷済, 点検完了 (exclude 納入済)
-  const targetVehicles = vehicles.filter(v => 
-    ['在庫', '点検中', '搬入済', '出荷済', '点検完了', '受け入れ予定'].includes(v.status)
-  ).filter(v => 
-    (v.modelName + v.serialNumber).toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  // If delivery is undecided, schedule one inspection a month after receiving.
+  // Once delivery is planned, apply the two-full-month stock rule.
+  const targetVehicles = vehicles
+    .filter(vehicle => getStockInspectionPlan(vehicle, tasks).isEligible)
+    .filter(vehicle =>
+      (vehicle.modelName + vehicle.serialNumber).toLowerCase().includes(searchTerm.toLowerCase())
+    );
 
   const targetParts = parts.filter(p => p.name.toLowerCase().includes(searchTerm.toLowerCase()));
   const monthLocale = lang === 'ja' ? ja : enUS;
   const monthFormat = lang === 'ja' ? 'yyyy年M月' : 'MMM yyyy';
-
-  const getVehicleStatusLabel = (status?: string) => {
-    if (!status) return t('common.notSet');
-    return tEnum('vehicleStatus', status);
-  };
 
   const months = [
     subMonths(currentDate, 1),
@@ -54,19 +68,54 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
     );
   };
 
-  const renderCellStatus = (task: ServiceTask | undefined, targetMonth: Date, vehicle: Vehicle) => {
-    const staffName = task?.staffId ? staff.find(s => s.id === task.staffId)?.name || t('common.notSet') : t('common.notSet');
-    const mockDeadline = format(new Date(targetMonth.getFullYear(), targetMonth.getMonth(), 25), 'yyyy-MM-dd');
+  const getScheduledDateForMonth = (vehicle: Vehicle, targetMonth: Date) => {
+    return getStockInspectionDateForMonth(getStockInspectionPlan(vehicle, tasks), targetMonth);
+  };
+
+  const renderCellStatus = (task: ServiceTask | undefined, targetMonth: Date, vehicle: Vehicle, scheduledDate?: Date, isProvisional = false) => {
+    const assignedStaffId = task?.staffIds?.[0] || task?.staffId;
+    const staffName = assignedStaffId ? staff.find(s => s.id === assignedStaffId)?.name || t('common.notSet') : t('common.notSet');
+
+    if (!task && !scheduledDate) {
+      return (
+        <div className="flex min-h-[90px] h-full flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50/70 p-3 text-slate-400">
+          <span className="text-[11px] font-bold">{t('fleet.stockCalendar.outsideStockPeriod')}</span>
+        </div>
+      );
+    }
+
+    const isReceivingResolved = tasks.some(receivingTask =>
+      receivingTask.vehicleId === vehicle.id &&
+      receivingTask.category === '受け入れ点検' &&
+      isTaskResolved(receivingTask)
+    );
+
+    if (!isReceivingResolved) {
+      return (
+        <div
+          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task?.id, plannedDate: scheduledDate })}
+          className="flex min-h-[90px] h-full cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white p-3 text-slate-500 transition hover:border-slate-400"
+        >
+          <span className="text-[11px] font-bold">{t('fleet.event.notExecuted')}</span>
+          <span className="mt-1.5 font-mono text-[11px] font-bold text-slate-600">
+            {format(task ? new Date(task.deadline) : scheduledDate!, 'yyyy-MM-dd')}
+          </span>
+          <span className="mt-1 max-w-full truncate px-1 text-[10px]">{t('fleet.event.assigneePrefix')} {staffName}</span>
+        </div>
+      );
+    }
 
     if (!task) {
       return (
         <div 
-          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth })}
+          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, plannedDate: scheduledDate })}
           className="flex flex-col items-center justify-center p-3 sm:p-4 rounded-xl border border-dashed border-slate-300 bg-white hover:border-slate-400 cursor-pointer transition h-full text-slate-500 min-h-[90px]"
         >
           <Calendar className="w-5 h-5 mb-1 text-slate-400" />
-          <span className="text-[13px] font-bold text-slate-600">{t('fleet.stockCalendar.scheduledLabel')}</span>
-          <span className="text-[11px] font-bold mt-1 font-mono text-slate-600">{mockDeadline}</span>
+          <span className="text-[13px] font-bold text-slate-600">
+            {isProvisional ? t('fleet.stockCalendar.provisionalScheduledLabel') : t('fleet.stockCalendar.scheduledLabel')}
+          </span>
+          <span className="text-[11px] font-bold mt-1 font-mono text-slate-600">{format(scheduledDate!, 'yyyy-MM-dd')}</span>
           <span className="text-[10px] text-slate-500 mt-1 truncate max-w-full px-1">{staffName}</span>
         </div>
       );
@@ -75,7 +124,7 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
     if (task.progress === '完了') {
       return (
         <div 
-          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id })}
+          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id, plannedDate: scheduledDate })}
           className="flex flex-col items-center justify-center p-3 sm:p-4 rounded-xl border border-emerald-200 bg-emerald-50/80 cursor-pointer hover:bg-emerald-100 transition h-full text-emerald-700 min-h-[90px]"
         >
           <CheckCircle2 className="w-5 h-5 mb-1 text-emerald-500" />
@@ -85,13 +134,25 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
         </div>
       );
     }
+
+    if (task.progress === 'スキップ') {
+      return (
+        <div
+          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id, plannedDate: scheduledDate })}
+          className="flex min-h-[90px] h-full cursor-pointer flex-col items-center justify-center rounded-xl border border-slate-300 bg-slate-100 p-3 text-slate-600 transition hover:bg-slate-200"
+        >
+          <span className="rounded bg-slate-200 px-2 py-0.5 text-[13px] font-black">{tEnum('taskProgress', 'スキップ')}</span>
+          <span className="mt-1 font-mono text-[11px] font-bold text-slate-500">{format(new Date(task.deadline), 'yyyy-MM-dd')}</span>
+        </div>
+      );
+    }
     
     const isOverdue = isBefore(new Date(task.deadline), new Date());
 
     if (isOverdue) {
       return (
         <div 
-          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id })}
+          onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id, plannedDate: scheduledDate })}
           className="flex flex-col items-center justify-center p-3 sm:p-4 rounded-xl border border-red-200 bg-red-50/80 cursor-pointer hover:bg-red-100 transition h-full text-red-700 min-h-[90px]"
         >
           <AlertTriangle className="w-5 h-5 mb-1 text-red-500" />
@@ -104,7 +165,7 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
 
     return (
       <div 
-        onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id })}
+        onClick={() => setSelectedTaskContext({ vehicleId: vehicle.id, month: targetMonth, taskId: task.id, plannedDate: scheduledDate })}
         className="flex flex-col items-center justify-center p-3 sm:p-4 rounded-xl border border-dashed border-slate-300 bg-white hover:border-slate-400 cursor-pointer transition h-full text-slate-500 min-h-[90px]"
       >
         <Calendar className="w-5 h-5 mb-1 text-slate-400" />
@@ -214,7 +275,7 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
                   {t('fleet.stockCalendar.vehicleTableHeader')}
                 </th>
                 {months.map((m, i) => {
-                  const isCurrent = i === 1;
+                  const isCurrent = isSameMonth(m, new Date());
                   return (
                     <th key={i} className={cn(
                       "p-0 text-center relative font-bold text-slate-800 border-r last:border-r-0",
@@ -233,51 +294,63 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
               </tr>
             </thead>
             <tbody className="bg-white">
-              {targetVehicles.map((v, rowIndex) => (
-                <tr key={v.id} className="transition border-t border-slate-200">
-                  <td className="px-5 py-4 border-r align-top">
-                    <div 
-                      className="cursor-pointer hover:bg-slate-50 p-2 -mx-2 rounded transition-colors group"
-                      onClick={() => setAssignModalData({ type: 'vehicle', id: v.id, name: v.modelName })}
-                    >
-                      <div className="flex justify-between items-start mb-2">
-                        <div className="flex items-baseline gap-2">
-                          <div className="font-bold text-slate-800 text-base group-hover:text-indigo-600 transition-colors">{v.modelName}</div>
-                          <div className="font-mono text-[13px] font-bold text-slate-500">{v.serialNumber}</div>
+              {targetVehicles.map((v) => {
+                const plan = getStockInspectionPlan(v, tasks);
+                return (
+                  <tr
+                    key={v.id}
+                    className={cn(
+                      "transition border-t border-slate-200",
+                      focusVehicleId === v.id && "bg-emerald-50/50 ring-2 ring-inset ring-emerald-300"
+                    )}
+                  >
+                    <td className="px-5 py-4 border-r align-top">
+                      <div
+                        className="cursor-pointer hover:bg-slate-50 p-2 -mx-2 rounded transition-colors group"
+                        onClick={() => setAssignModalData({ type: 'vehicle', id: v.id, name: v.modelName })}
+                      >
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-baseline gap-2">
+                            <div className="font-bold text-slate-800 text-base group-hover:text-indigo-600 transition-colors">{v.modelName}</div>
+                            <div className="font-mono text-[13px] font-bold text-slate-500">{v.serialNumber}</div>
+                          </div>
+                          <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-bold text-emerald-700">
+                            {t('fleet.stockCalendar.stockTreatment')}
+                          </span>
                         </div>
-                        <span className={cn(
-                          "inline-flex px-2 py-0.5 text-[11px] font-bold rounded-full border",
-                          v.status === '在庫' ? "border-green-200 text-green-700 bg-green-50" :
-                          v.status === '点検中' ? "border-blue-200 text-blue-700 bg-blue-50" :
-                          v.status === '出荷済' || v.status === '搬入済' ? "border-slate-200 text-slate-700 bg-slate-50" :
-                          "border-gray-200 text-gray-700 bg-gray-50"
+                        <div className="text-xs text-slate-500 flex items-center font-medium mt-1.5">
+                          <Package className="w-3.5 h-3.5 mr-1" />
+                          {t('fleet.stockCalendar.stockPeriod', {
+                            start: plan.receivingDate ? format(plan.receivingDate, 'yyyy-MM-dd') : t('common.notSet'),
+                            end: plan.deliveryDate ? format(plan.deliveryDate, 'yyyy-MM-dd') : t('fleet.stockCalendar.deliveryUndecided'),
+                          })}
+                        </div>
+                        <div className="mt-1.5 text-[11px] font-bold text-emerald-700">
+                          {plan.isProvisional
+                            ? t('fleet.stockCalendar.provisionalInspectionCount')
+                            : t('fleet.stockCalendar.inspectionCount', { count: plan.dueDates.length })}
+                        </div>
+                        <div className="text-xs text-indigo-500 mt-2 font-bold opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
+                          <Calendar className="w-3 h-3 mr-1" /> {t('fleet.stockCalendar.assignAction')}
+                        </div>
+                      </div>
+                    </td>
+                    {months.map((m, i) => {
+                      const scheduledDate = getScheduledDateForMonth(v, m);
+                      const task = scheduledDate ? getTaskForMonth(v.id, m) : undefined;
+                      const isCurrent = isSameMonth(m, new Date());
+                      return (
+                        <td key={i} className={cn(
+                          "p-3 align-middle border-r last:border-r-0",
+                          isCurrent ? "bg-emerald-50/10" : ""
                         )}>
-                          {getVehicleStatusLabel(v.status)}
-                        </span>
-                      </div>
-                      <div className="text-xs text-slate-500 flex items-center font-medium mt-1.5">
-                        <Package className="w-3.5 h-3.5 mr-1" />
-                        {t('fleet.stockCalendar.arrivalPrefix')}{format(new Date(v.arrivalDate || new Date()), 'yyyy-MM-dd')}
-                      </div>
-                      <div className="text-xs text-indigo-500 mt-2 font-bold opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
-                        <Calendar className="w-3 h-3 mr-1" /> {t('fleet.stockCalendar.assignAction')}
-                      </div>
-                    </div>
-                  </td>
-                  {months.map((m, i) => {
-                    const task = getTaskForMonth(v.id, m);
-                    const isCurrent = i === 1;
-                    return (
-                      <td key={i} className={cn(
-                        "p-3 align-middle border-r last:border-r-0",
-                        isCurrent ? "bg-emerald-50/10" : ""
-                      )}>
-                        {renderCellStatus(task, m, v)}
-                      </td>
-                    )
-                  })}
-                </tr>
-              ))}
+                          {renderCellStatus(task, m, v, scheduledDate, plan.isProvisional)}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                );
+              })}
               {targetVehicles.length === 0 && (
                 <tr>
                   <td colSpan={5} className="px-6 py-12 text-center text-slate-500 font-medium">
@@ -349,7 +422,13 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
                   <button 
                     onClick={() => {
                       if (assignModalData.type === 'vehicle') {
-                        setSelectedTaskContext({ vehicleId: assignModalData.id, month: new Date() });
+                        const vehicle = vehicles.find(item => item.id === assignModalData.id);
+                        const plannedDate = vehicle ? getStockInspectionPlan(vehicle, tasks).dueDates[0] : undefined;
+                        setSelectedTaskContext({
+                          vehicleId: assignModalData.id,
+                          month: plannedDate || new Date(),
+                          plannedDate,
+                        });
                       } else {
                         alert(t('fleet.stockCalendar.partAssignAlert'));
                       }
@@ -404,27 +483,48 @@ export const StockCalendarView = ({ isEmbedded = false }: { isEmbedded?: boolean
   );
 };
 
-function StockInspectionModal({ context, onClose }: { context: {vehicleId: string, month: Date, taskId?: string}, onClose: () => void }) {
-  const { vehicles, tasks, staff, tools, contracts, addTask, updateTask, deleteTask, t, lang } = useApp();
+function StockInspectionModal({ context, onClose }: { context: {vehicleId: string, month: Date, taskId?: string, plannedDate?: Date}, onClose: () => void }) {
+  const { vehicles, tasks, staff, addTask, updateTask, deleteTask, t, lang } = useApp();
   const selectedVehicle = vehicles.find(v => v.id === context.vehicleId);
-  const existingTask = context.taskId ? tasks.find(t => t.id === context.taskId) : null;
+  const existingTask = tasks.find(task => context.taskId
+    ? task.id === context.taskId
+    : task.vehicleId === context.vehicleId && task.category === '在庫点検' && isSameMonth(new Date(task.deadline), context.month)
+  );
+  const isReceivingResolved = tasks.some(task =>
+    task.vehicleId === context.vehicleId &&
+    task.category === '受け入れ点検' &&
+    isTaskResolved(task)
+  );
   const monthLocale = lang === 'ja' ? ja : enUS;
   const monthFormat = lang === 'ja' ? 'yyyy年M月' : 'MMM yyyy';
   
-  const mockDeadline = format(new Date(context.month.getFullYear(), context.month.getMonth(), 25), 'yyyy-MM-dd');
-  const [date, setDate] = React.useState(existingTask?.deadline ? format(new Date(existingTask.deadline), 'yyyy-MM-dd') : mockDeadline);
-  const [staffId, setStaffId] = React.useState(existingTask?.staffId || '');
-  const [isRegular, setIsRegular] = React.useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = React.useState(false);
+  const plannedDeadline = context.plannedDate || (existingTask ? new Date(existingTask.deadline) : new Date(context.month.getFullYear(), context.month.getMonth(), 25));
+  const [date, setDate] = React.useState(existingTask?.deadline ? format(new Date(existingTask.deadline), 'yyyy-MM-dd') : format(plannedDeadline, 'yyyy-MM-dd'));
+  const [staffId, setStaffId] = React.useState(existingTask?.staffIds?.[0] || existingTask?.staffId || '');
+  const isCompleted = existingTask?.progress === '完了';
+  const isSkipped = existingTask?.progress === 'スキップ';
+  const isPendingApproval = existingTask?.progress === '承認待ち';
+  const isAssigned = Boolean(existingTask?.staffIds?.length || existingTask?.staffId);
+  const caseAction = !isReceivingResolved
+    ? 'create'
+    : isSkipped || isPendingApproval
+      ? undefined
+      : isCompleted || isAssigned ? 'detail' : 'create';
 
   if (!selectedVehicle) return null;
 
   const handleSave = () => {
+    if (!date) return;
+    const deadline = new Date(`${date}T00:00:00`).toISOString();
     if (existingTask) {
       updateTask(existingTask.id, {
-        deadline: new Date(date).toISOString(),
+        deadline,
+        startDate: deadline,
         staffId: staffId || undefined,
-        progress: staffId ? (existingTask.progress === '完了' ? '完了' : '進行中') : '未着手'
+        staffIds: staffId ? [staffId] : undefined,
+        progress: isCompleted || isSkipped || isPendingApproval
+          ? existingTask.progress
+          : staffId ? '進行中' : '未着手',
       });
     } else {
       addTask({
@@ -434,58 +534,128 @@ function StockInspectionModal({ context, onClose }: { context: {vehicleId: strin
         category: '在庫点検',
         progress: staffId ? '進行中' : '未着手',
         urgency: '1ヶ月以内',
-        deadline: new Date(date).toISOString(),
+        deadline,
+        startDate: deadline,
         staffId: staffId || undefined,
+        staffIds: staffId ? [staffId] : undefined,
       });
     }
     onClose();
   };
 
+  const handleSkip = () => {
+    if (!isReceivingResolved || isCompleted || isSkipped || isPendingApproval || !date) return;
+    const deadline = new Date(`${date}T00:00:00`).toISOString();
+
+    if (existingTask) {
+      updateTask(existingTask.id, {
+        progress: 'スキップ',
+        deadline,
+        isApproved: false,
+      });
+    } else {
+      addTask({
+        vehicleId: selectedVehicle.id,
+        targetModelName: selectedVehicle.modelName,
+        title: t('fleet.stockCalendar.taskTitle', { month: format(context.month, monthFormat, { locale: monthLocale }) }),
+        category: '在庫点検',
+        progress: 'スキップ',
+        urgency: '1ヶ月以内',
+        deadline,
+      });
+    }
+
+    onClose();
+  };
+
+  const handleReportSubmit = () => {
+    if (!existingTask || !isReceivingResolved || isCompleted || isSkipped || isPendingApproval || !date) return;
+    const deadline = new Date(`${date}T00:00:00`).toISOString();
+    updateTask(existingTask.id, {
+      deadline,
+      startDate: deadline,
+      staffId: staffId || undefined,
+      staffIds: staffId ? [staffId] : undefined,
+      progress: '承認待ち',
+    });
+    onClose();
+  };
+
+  const handleDelete = () => {
+    if (!existingTask || !window.confirm(t('fleet.stockCalendar.deleteInspectionConfirm'))) return;
+    deleteTask(existingTask.id);
+    onClose();
+  };
+
   return (
-    <div className="fixed inset-0 bg-slate-900/50 flex justify-center items-center z-[60] p-4" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg flex flex-col max-h-[90vh] overflow-hidden" onClick={e => e.stopPropagation()}>
-        <div className="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 shrink-0">
-          <div>
-            <h3 className="font-bold text-slate-800 flex items-center">
-              <Calendar className="w-5 h-5 mr-2 text-indigo-500" />
-              {t('fleet.stockCalendar.maintenanceModalTitle', { month: format(context.month, monthFormat, { locale: monthLocale }) })}
-            </h3>
-            <p className="text-xs text-slate-500 mt-1 font-mono">{selectedVehicle.modelName} ({selectedVehicle.serialNumber})</p>
-          </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 transition p-2 rounded-full hover:bg-slate-200">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div role="dialog" aria-modal="true" aria-labelledby="stock-inspection-modal-title" className="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-100 bg-slate-50 px-6 py-5">
+          <h3 id="stock-inspection-modal-title" className="flex items-center text-xl font-black text-slate-800">
+            <FileText className="mr-2 h-5 w-5 shrink-0 text-indigo-600" />
+            {t('fleet.event.modalTitle')}
+          </h3>
+          <button type="button" aria-label={t('common.close')} onClick={onClose} className="rounded-full bg-slate-200/50 p-2 text-slate-400 transition hover:bg-slate-200 hover:text-slate-600">
             <X className="w-5 h-5" />
           </button>
         </div>
         
         <div className="p-6 overflow-y-auto">
           <div className="space-y-6">
-            <div className="bg-indigo-50 p-4 rounded-lg border border-indigo-100 flex items-start">
-              <Info className="w-5 h-5 text-indigo-500 mr-3 shrink-0 mt-0.5" />
-              <div className="text-sm text-indigo-900">
-                <p className="font-bold mb-1">{t('fleet.stockCalendar.maintenanceInfoTitle')}</p>
-                <p>{t('fleet.stockCalendar.maintenanceInfoBody')}</p>
+            <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
+              <div className="mb-1 text-xs font-bold text-indigo-400">{t('fleet.requiredHeaders.stockInspection')}</div>
+              <div className="mb-2 text-lg font-black text-indigo-900">
+                {existingTask?.title || t('fleet.stockCalendar.taskTitle', { month: format(context.month, monthFormat, { locale: monthLocale }) })}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <span className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-bold text-slate-700 shadow-sm">
+                  {t('fleet.event.vehicleLabel')}: {selectedVehicle.modelName} ({selectedVehicle.serialNumber})
+                </span>
+                <span className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-bold text-slate-700 shadow-sm">
+                  {t('fleet.event.targetDateLabel')}: {format(plannedDeadline, 'yyyy/MM/dd')}
+                </span>
               </div>
             </div>
 
+            {!isReceivingResolved && (
+              <div className="flex items-start rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-700">
+                <Info className="mr-3 mt-0.5 h-5 w-5 shrink-0 text-indigo-500" />
+                <div>
+                  <p className="text-sm font-black">{t('fleet.event.workflowGuidanceTitle')}</p>
+                  <p className="mt-1 text-xs font-medium leading-relaxed">
+                    {t('fleet.event.completionBlockedDescription', { step: t('fleet.requiredHeaders.receiving') })}
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-bold text-slate-700 mb-2">{t('fleet.stockCalendar.inspectionDateLabel')}</label>
+                <label htmlFor="stock-inspection-date" className="mb-2 flex items-center text-sm font-bold text-slate-700">
+                  <Calendar className="mr-1 h-4 w-4 text-slate-400" />
+                  {t('fleet.event.scheduledDateLabel')}
+                </label>
                 <input 
+                  id="stock-inspection-date"
                   type="date" 
                   value={date}
                   onChange={e => setDate(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
+                  className="w-full rounded-lg border border-slate-300 px-4 py-2.5 font-medium text-slate-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
                 />
               </div>
 
               <div>
-                <label className="block text-sm font-bold text-slate-700 mb-2">{t('fleet.stockCalendar.assigneeLabel')}</label>
+                <label htmlFor="stock-inspection-staff" className="mb-2 flex items-center text-sm font-bold text-slate-700">
+                  <UserPlus className="mr-1 h-4 w-4 text-slate-400" />
+                  {t('fleet.event.assigneeLabel')}
+                </label>
                 <select 
+                  id="stock-inspection-staff"
                   value={staffId}
                   onChange={e => setStaffId(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none bg-white"
+                  className="w-full rounded-lg border border-slate-300 bg-white px-4 py-2.5 font-medium text-slate-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500"
                 >
-                  <option value="">{t('fleet.stockCalendar.noAssigneeOption')}</option>
+                  <option value="">{t('fleet.event.noAssigneeOption')}</option>
                   {staff.map(s => (
                     <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
                   ))}
@@ -493,41 +663,57 @@ function StockInspectionModal({ context, onClose }: { context: {vehicleId: strin
               </div>
             </div>
             
-            <TaskConfigSection 
-              task={{
-                name: t('fleet.stockCalendar.maintenanceTaskName'),
-                reportFormatId: 'stock_inspection',
-                paidServiceId: ''
-              }}
-              updateTask={() => {}}
-            />
+            {caseAction && <EventCaseActions action={caseAction} />}
           </div>
         </div>
 
-        <div className="px-6 py-4 border-t border-slate-200 bg-slate-50 flex justify-between shrink-0">
-          {existingTask ? (
-            <button 
-              onClick={() => setShowDeleteConfirm(true)}
-              className="px-4 py-2 text-sm font-bold text-red-600 hover:bg-red-50 rounded-lg transition"
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4">
+          <div className="flex flex-wrap gap-2">
+            {existingTask && (
+              <button
+                type="button"
+                onClick={handleDelete}
+                className="whitespace-nowrap rounded-lg px-3 py-2.5 text-sm font-bold text-red-600 transition hover:bg-red-50"
+              >
+                {t('common.delete')}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleSkip}
+              disabled={!isReceivingResolved || isCompleted || isSkipped || isPendingApproval || !date}
+              className="whitespace-nowrap rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-bold text-slate-600 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {t('common.delete')}
+              {t('fleet.event.skipStep')}
             </button>
-          ) : (
-            <div></div>
-          )}
-          <div className="flex space-x-3">
+          </div>
+          <div className="ml-auto flex flex-wrap justify-end gap-3">
             <button 
+              type="button"
               onClick={onClose}
-              className="px-4 py-2 text-sm font-bold text-slate-600 hover:bg-slate-200 rounded-lg transition"
+              className="whitespace-nowrap rounded-lg px-5 py-2.5 font-bold text-slate-600 transition hover:bg-slate-200"
             >
               {t('common.cancel')}
             </button>
             <button 
+              type="button"
               onClick={handleSave}
-              className="px-6 py-2 text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition shadow-sm"
+              disabled={!date}
+              className="whitespace-nowrap rounded-lg bg-slate-800 px-6 py-2.5 font-bold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {t('fleet.stockCalendar.saveAndAssign')}
+              {t('fleet.event.saveButton')}
             </button>
+            {existingTask && isReceivingResolved && !isCompleted && !isSkipped && !isPendingApproval && (
+              <button
+                type="button"
+                onClick={handleReportSubmit}
+                disabled={!date}
+                className="flex items-center whitespace-nowrap rounded-lg bg-indigo-600 px-6 py-2.5 font-bold text-white shadow-md shadow-indigo-200 transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <CheckCircle className="mr-2 h-4 w-4" />
+                {t('fleet.event.reportSubmitButton')}
+              </button>
+            )}
           </div>
         </div>
       </div>

@@ -36,7 +36,7 @@ interface AppContextType {
   setView: (v: ViewState) => void;
   updateVehicle: (id: string, updates: Partial<Vehicle>) => void;
   updateTask: (id: string, updates: Partial<ServiceTask>) => void;
-  addTask: (task: Omit<ServiceTask, 'id' | 'progress'>) => void;
+  addTask: (task: Omit<ServiceTask, 'id' | 'progress'> & { progress?: ServiceTask['progress'] }) => void;
   addVehicle: (vehicle: Omit<Vehicle, 'id'>) => string;
   updateParking: (areas: ParkingArea[]) => void;
   addContract: (contract: Omit<ContractTemplate, 'id'>) => void;
@@ -175,11 +175,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  const addTask = (taskProps: Omit<ServiceTask, 'id' | 'progress'>) => {
+  const addTask = (taskProps: Omit<ServiceTask, 'id' | 'progress'> & { progress?: ServiceTask['progress'] }) => {
     const newTask: ServiceTask = {
       ...taskProps,
       id: `t${Date.now()}`,
-      progress: '未着手'
+      progress: taskProps.progress || '未着手'
     };
     setTasks([...tasks, newTask]);
   };
